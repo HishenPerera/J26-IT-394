@@ -9,6 +9,7 @@
  *   deactivate() → cleanup
  */
 
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { SecurityAnalyzer } from './analyzer/securityAnalyzer.js';
 import { DiagnosticManager, SentinelHoverProvider } from './diagnostics/diagnosticManager.js';
@@ -16,12 +17,20 @@ import { SecurityEventClient } from './events/securityEventClient.js';
 import { DeveloperAction, SecurityFinding } from './analyzer/types.js';
 import { VULNERABILITY_METADATA } from './diagnostics/vulnerabilityMetadata.js';
 import { generateContextualExplanation } from './diagnostics/contextualExplainer.js';
+import { DeveloperRecordStore } from './data/developerRecordStore.js';
+import { AuthManager } from './auth/authManager.js';
+import { buildLoginHtml } from './webview/loginView.js';
+import { buildDeveloperDashboardHtml } from './webview/developerDashboard.js';
+import { buildSupervisorDashboardHtml } from './webview/supervisorDashboard.js';
+import { buildAdminDashboardHtml } from './webview/adminDashboard.js';
 
 // ─── Module-level instances (kept alive for the extension lifetime) ─────────
 
 let analyzer: SecurityAnalyzer;
 let diagnosticManager: DiagnosticManager;
 let eventClient: SecurityEventClient;
+let recordStore: DeveloperRecordStore;
+let authManager: AuthManager;
 let outputChannel: vscode.OutputChannel;
 let debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
@@ -34,16 +43,27 @@ let dashboardPanel: vscode.WebviewPanel | undefined;
 // Extension root URI — stored in activate() for resource loading
 let extensionUri: vscode.Uri;
 
+// Extension context — stored for authManager and DATA dir access
+let extensionContext: vscode.ExtensionContext;
+
 // ─── activate() ──────────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionUri = context.extensionUri; // store for webview resource loading
+  extensionContext = context;           // store for auth + DATA dir access
   outputChannel = vscode.window.createOutputChannel('Sentinel Security');
   log('🛡 Sentinel activated.');
 
   analyzer = new SecurityAnalyzer();
   diagnosticManager = new DiagnosticManager();
   eventClient = new SecurityEventClient();
+
+  // Initialise developer record store — persists findings to src/DATA/<developerId>_vulnerability_records.json
+  recordStore = new DeveloperRecordStore(context.extensionPath);
+
+  // Initialise auth manager — role-based login system
+  authManager = new AuthManager(context);
+  log('🔐 Auth manager initialised.');
 
   // ── Register commands ────────────────────────────────────────────────────
 
@@ -184,6 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   log(`Session: ${eventClient.getSessionId()}`);
   log(`Rules loaded: ${analyzer.getRules().map(r => r.ruleName).join(', ')}`);
+  log(`Developer records → ${recordStore.getRecordFilePath()}`);
 }
 
 // ─── deactivate() ─────────────────────────────────────────────────────────────
@@ -191,6 +212,7 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {
   diagnosticManager.dispose();
   eventClient.dispose();
+  recordStore.dispose();
   outputChannel.dispose();
   // Clear all pending debounce timers
   debounceTimers.forEach(t => clearTimeout(t));
@@ -229,6 +251,11 @@ async function analyzeDocument(
   // Report to backend (Phase 5)
   for (const finding of findings) {
     void eventClient.reportDetection(finding);
+  }
+
+  // Persist developer vulnerability record to DATA/ (JSON)
+  for (const finding of findings) {
+    void recordStore.save(finding, eventClient.getSessionId());
   }
 
   // Show terminal alert for HIGH/CRITICAL findings
@@ -362,26 +389,64 @@ class SentinelCodeActionProvider implements vscode.CodeActionProvider {
 
 // ─── Dashboard Webview ────────────────────────────────────────────────────────
 
-/** Refresh the live dashboard panel with current findings from the cache. */
+/**
+ * Refresh the live dashboard panel.
+ * - If no session → show login screen.
+ * - If session → route to the correct role dashboard.
+ */
 function refreshDashboard(): void {
   if (!dashboardPanel) {
     return;
   }
+
+  const logoUri = dashboardPanel.webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, 'resources', 'sentinel-logo.png')
+  ).toString() + '?t=' + Date.now();
+
+  const cspSource = dashboardPanel.webview.cspSource;
+  const session = authManager?.getSession();
+
+  if (!session) {
+    // Not logged in — show login screen
+    dashboardPanel.title = 'Sentinel — Login';
+    dashboardPanel.webview.html = buildLoginHtml(cspSource, logoUri);
+    return;
+  }
+
+  // ── Route to role-specific dashboard ──────────────────────────────────────
   const allFindings: SecurityFinding[] = [];
   for (const findings of findingsCache.values()) {
     allFindings.push(...findings);
   }
   const summary = analyzer.summarize(allFindings);
+  const dataDir = path.join(extensionContext.extensionPath, 'src', 'DATA');
 
-  // Convert the local logo path to a webview-safe URI
-  const logoUri = dashboardPanel.webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, 'resources', 'sentinel-logo.png')
-  );
-
-  // Append a cache-buster query parameter to force webview to reload the image
-  const logoUriWithCacheBuster = logoUri.toString() + '?t=' + Date.now();
-
-  dashboardPanel.webview.html = buildDashboardHtml(summary, allFindings, logoUriWithCacheBuster);
+  if (session.role === 'developer') {
+    dashboardPanel.title = `Sentinel — ${session.displayName}`;
+    dashboardPanel.webview.html = buildDeveloperDashboardHtml(
+      summary, allFindings, session, logoUri, cspSource,
+      analyzer.getRules().length,
+      eventClient?.getSessionId() ?? 'N/A',
+    );
+  } else if (session.role === 'supervisor') {
+    dashboardPanel.title = 'Sentinel — Supervisor Dashboard';
+    dashboardPanel.webview.html = buildSupervisorDashboardHtml(
+      session, dataDir, cspSource, logoUri,
+    );
+  } else if (session.role === 'administrator') {
+    dashboardPanel.title = 'Sentinel — Admin Dashboard';
+    const config = vscode.workspace.getConfiguration('sentinel');
+    const packageJson = require(path.join(extensionContext.extensionPath, 'package.json'));
+    dashboardPanel.webview.html = buildAdminDashboardHtml(
+      session,
+      authManager.getAllUsers(),
+      dataDir,
+      cspSource,
+      logoUri,
+      packageJson.version ?? '0.1.0',
+      config.get<string>('backendUrl', 'http://localhost:3000'),
+    );
+  }
 }
 
 function showDashboard(context: vscode.ExtensionContext): void {
@@ -399,7 +464,6 @@ function showDashboard(context: vscode.ExtensionContext): void {
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      // Allow the webview to load images from the resources/ folder
       localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'resources')],
     },
   );
@@ -409,7 +473,79 @@ function showDashboard(context: vscode.ExtensionContext): void {
     dashboardPanel = undefined;
   }, null, context.subscriptions);
 
+  // Handle messages from the webview (login, logout, admin actions)
+  dashboardPanel.webview.onDidReceiveMessage(
+    (message: { command: string; [key: string]: any }) => {
+      handleWebviewMessage(message);
+    },
+    undefined,
+    context.subscriptions,
+  );
+
   refreshDashboard();
+}
+
+// ─── Webview Message Handler ──────────────────────────────────────────────────
+
+function handleWebviewMessage(message: { command: string; [key: string]: any }): void {
+  switch (message.command) {
+    case 'LOGIN': {
+      const session = authManager.login(message.username as string, message.password as string);
+      if (session) {
+        log(`🔐 Login: ${session.username} (${session.role})`);
+        refreshDashboard();
+      } else {
+        // Show login screen again with error
+        if (dashboardPanel) {
+          const logoUri = dashboardPanel.webview.asWebviewUri(
+            vscode.Uri.joinPath(extensionUri, 'resources', 'sentinel-logo.png')
+          ).toString();
+          dashboardPanel.webview.html = buildLoginHtml(
+            dashboardPanel.webview.cspSource,
+            logoUri,
+            'Invalid username or password. Please try again.',
+          );
+        }
+      }
+      break;
+    }
+
+    case 'LOGOUT': {
+      const wasUser = authManager.getSession()?.username ?? 'unknown';
+      authManager.logout();
+      log(`🔐 Logout: ${wasUser}`);
+      refreshDashboard();
+      break;
+    }
+
+    case 'ADMIN_ADD_USER': {
+      const result = authManager.addUser(
+        message.username as string,
+        message.password as string,
+        message.role as 'developer' | 'supervisor' | 'administrator',
+        message.displayName as string,
+        message.email as string,
+      );
+      log(`[Admin] Add user "${message.username as string}": ${result.message}`);
+      dashboardPanel?.webview.postMessage({ command: 'ADMIN_ADD_RESULT', ...result });
+      break;
+    }
+
+    case 'ADMIN_REMOVE_USER': {
+      const result = authManager.removeUser(message.userId as string);
+      log(`[Admin] Remove user "${message.username as string}": ${result.message}`);
+      dashboardPanel?.webview.postMessage({ command: 'ADMIN_USER_RESULT', ...result });
+      break;
+    }
+
+    case 'REFRESH_ADMIN': {
+      refreshDashboard();
+      break;
+    }
+
+    default:
+      break;
+  }
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
@@ -576,252 +712,220 @@ function buildFixHtml(finding: SecurityFinding, _meta: any): string {
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Fira+Code&display=swap');
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Inter', sans-serif; padding: 24px; color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); line-height: 1.6; }
-    h1 { font-size: 1.2em; color: #73c991; margin-bottom: 6px; }
+    h1 { font-size: 1.2em; color: #3fb950; margin-bottom: 6px; }
     .subtitle { color: var(--vscode-descriptionForeground); font-size: 0.9em; margin-bottom: 24px; }
-    .code-block { border-radius: 8px; overflow: hidden; margin: 12px 0; }
     .code-label { font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 6px 14px; }
-    .code-label.danger { background: #f14c4c22; color: #f14c4c; }
-    .code-label.safe   { background: #73c99122; color: #73c991; }
+    .code-label.danger { background: #f47067222; color: #f47067; }
+    .code-label.safe   { background: #3fb9501a; color: #3fb950; }
     pre { font-family: 'Fira Code', monospace; font-size: 13px; padding: 14px 16px; background: var(--vscode-textCodeBlock-background); overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
-    .pre-danger { border: 1px solid #f14c4c33; border-radius: 8px; overflow: hidden; }
-    .pre-safe   { border: 1px solid #73c99133; border-radius: 8px; overflow: hidden; }
-    .note { background: #73c99111; border: 1px solid #73c99133; border-radius: 8px; padding: 12px 16px; font-size: 0.9em; margin-top: 12px; }
+    .pre-danger { border: 1px solid rgba(244,112,103,0.25); border-radius: 8px; overflow: hidden; }
+    .pre-safe   { border: 1px solid rgba(63,185,80,0.2);   border-radius: 8px; overflow: hidden; }
+    .note { background: rgba(63,185,80,0.07); border: 1px solid rgba(63,185,80,0.18); border-radius: 8px; padding: 12px 16px; font-size: 0.9em; margin-top: 12px; color: #3fb950; }
   </style>
 </head>
 <body>
   <h1>✅ Secure Fix &mdash; ${finding.type.replace(/_/g, ' ')}</h1>
   <div class="subtitle">Line ${finding.lineNumber} in ${finding.fileName.split('/').pop()}</div>
-
   <div class="pre-danger">
     <div class="code-label danger">❌ Your vulnerable code</div>
     <pre>${escHtml(ctx.vulnerableCode)}</pre>
   </div>
-
   <div class="pre-safe" style="margin-top:16px">
     <div class="code-label safe">✅ Fixed version</div>
     <pre>${escHtml(ctx.fixedCode)}</pre>
   </div>
-
   <div class="note">💡 ${escHtml(ctx.fixExplanation)}</div>
 </body>
 </html>`;
 }
 
-function buildDashboardHtml(summary: any, findings: SecurityFinding[], logoUri: string = ''): string {
+function buildDashboardHtml(summary: any, findings: SecurityFinding[], logoUri: string = '', cspSource: string = 'vscode-webview:'): string {
   const scoreRaw = findings.length === 0 ? 100 :
     Math.max(0, 100 - (summary.criticalCount * 25 + summary.highCount * 10 + summary.mediumCount * 5 + summary.lowCount * 2));
-  const scoreColor = scoreRaw >= 80 ? '#73c991' : scoreRaw >= 50 ? '#e9a825' : '#f14c4c';
+  const scoreColor  = scoreRaw >= 80 ? '#3fb950' : scoreRaw >= 50 ? '#d29922' : '#f47067';
+  const circumference = 283;
+  const dashOffset    = circumference - (scoreRaw / 100) * circumference;
 
-  // Build a detailed card for each finding using contextual explanation
   const findingCards = findings.map(f => {
-    const ctx = generateContextualExplanation(f);
-    const conf = Math.round(f.confidence * 100);
-    const sevColor = f.severity === 'CRITICAL' || f.severity === 'HIGH' ? '#f14c4c' :
-                     f.severity === 'MEDIUM' ? '#e9a825' : '#73c991';
-    const sevIcon  = f.severity === 'CRITICAL' ? '🚨' :
-                     f.severity === 'HIGH' ? '🔴' :
-                     f.severity === 'MEDIUM' ? '🟠' : '🟡';
+    const ctx      = generateContextualExplanation(f);
+    const conf     = Math.round(f.confidence * 100);
+    const sevColor = f.severity === 'CRITICAL' || f.severity === 'HIGH' ? '#f47067'
+                   : f.severity === 'MEDIUM' ? '#d29922' : '#3fb950';
+    const sevIcon  = f.severity === 'CRITICAL' ? '&#x1F6A8;'
+                   : f.severity === 'HIGH'     ? '&#x1F534;'
+                   : f.severity === 'MEDIUM'   ? '&#x1F7E0;' : '&#x1F7E1;';
     return `
-    <div class="finding-card" id="card-${f.id}">
-      <!-- Card header -->
-      <div class="card-header" onclick="toggleCard('${f.id}')">
-        <div class="card-header-left">
-          <span class="sev-pill" style="background:${sevColor}22;color:${sevColor};border-color:${sevColor}44">
-            ${sevIcon} ${f.severity}
-          </span>
-          <div class="card-title">${f.type.replace(/_/g, ' ')}</div>
-          <div class="card-sub">${f.fileName.split('/').pop()} &mdash; Line ${f.lineNumber}</div>
-        </div>
-        <div class="card-header-right">
-          <span class="conf-badge">${conf}% confidence</span>
-          <span class="toggle-icon" id="icon-${f.id}">&#9660;</span>
-        </div>
+<div class="card" id="card-${f.id}">
+  <div class="card-hdr" onclick="tog('${f.id}')">
+    <div class="lft">
+      <span class="pill" style="background:${sevColor}22;color:${sevColor};border:1px solid ${sevColor}44">${sevIcon} ${f.severity}</span>
+      <div>
+        <div class="ctitle">${f.type.replace(/_/g, ' ')}</div>
+        <div class="cfile">&#x1F4C4; ${escHtml(f.fileName.split('/').pop() ?? '')} &middot; Line ${f.lineNumber}</div>
       </div>
-
-      <!-- Headline (always visible) -->
-      <div class="card-headline">${escHtml(ctx.headline)}</div>
-
-      <!-- Expandable detail -->
-      <div class="card-detail" id="detail-${f.id}">
-
-        <!-- Why dangerous -->
-        <div class="detail-section">
-          <div class="detail-label">Why is this vulnerable?</div>
-          <div class="detail-text">${escHtml(ctx.whyDangerous)}</div>
-        </div>
-
-        <!-- Side-by-side: vulnerable vs fixed -->
-        <div class="code-compare">
-          <div class="code-col">
-            <div class="code-label danger-label">❌ Your vulnerable code</div>
-            <pre class="pre-danger">${escHtml(ctx.vulnerableCode)}</pre>
-          </div>
-          <div class="code-col">
-            <div class="code-label safe-label">✅ Fixed version</div>
-            <pre class="pre-safe">${escHtml(ctx.fixedCode)}</pre>
-          </div>
-        </div>
-
-        <!-- Attack scenario -->
-        <div class="detail-section">
-          <div class="detail-label">Attack scenario</div>
-          <div class="attack-box">${escHtml(ctx.attackScenario)}</div>
-        </div>
-
-        <!-- Fix explanation -->
-        <div class="fix-note">💡 ${escHtml(ctx.fixExplanation)}</div>
-
+    </div>
+    <div class="rgt">
+      <span class="conf">${conf}%</span>
+      <span class="chev" id="chev-${f.id}">&#9660;</span>
+    </div>
+  </div>
+  <div class="chl">${escHtml(ctx.headline)}</div>
+  <div class="cbody" id="body-${f.id}">
+    <div class="dlbl">Why is this vulnerable?</div>
+    <div class="dtxt">${escHtml(ctx.whyDangerous)}</div>
+    <div class="cmp">
+      <div>
+        <div class="clbl dlbl-d">Vulnerable code</div>
+        <pre class="pre-d">${escHtml(ctx.vulnerableCode)}</pre>
       </div>
-    </div>`;
+      <div>
+        <div class="clbl dlbl-s">Fixed version</div>
+        <pre class="pre-s">${escHtml(ctx.fixedCode)}</pre>
+      </div>
+    </div>
+    <div class="dlbl">Attack scenario</div>
+    <div class="atk">${escHtml(ctx.attackScenario)}</div>
+    <div class="fix">&#x1F4A1; ${escHtml(ctx.fixExplanation)}</div>
+  </div>
+</div>`;
   }).join('');
 
   return `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code&display=swap');
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Inter', var(--vscode-font-family), sans-serif; padding: 24px; color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); line-height: 1.6; }
-
-    /* ── Header ── */
-    .dash-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; padding-bottom: 16px; border-bottom: 1px solid var(--vscode-panel-border); }
-    .dash-title { display: flex; align-items: center; gap: 14px; }
-    .dash-logo { width: 44px; height: 44px; object-fit: contain; flex-shrink: 0; }
-    .dash-title-text { display: flex; flex-direction: column; gap: 1px; }
-    .dash-title-main { font-size: 1.4em; font-weight: 700; letter-spacing: -0.3px; }
-    .dash-title-sub { font-size: 0.75em; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 1px; }
-    .dash-session { font-size: 0.78em; color: var(--vscode-descriptionForeground); }
-
-    /* ── Stat Cards ── */
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 32px; }
-    .stat { padding: 16px 18px; border-radius: 10px; background: var(--vscode-editor-inactiveSelectionBackground); border: 1px solid var(--vscode-panel-border); }
-    .stat-num { font-size: 2.2em; font-weight: 700; line-height: 1; }
-    .stat-label { font-size: 0.75em; color: var(--vscode-descriptionForeground); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
-
-    /* ── Section title ── */
-    .section-title { font-size: 0.85em; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--vscode-descriptionForeground); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
-    .section-title::after { content: ''; flex: 1; height: 1px; background: var(--vscode-panel-border); }
-
-    /* ── Finding Cards ── */
-    .findings { display: flex; flex-direction: column; gap: 12px; }
-    .finding-card { border: 1px solid var(--vscode-panel-border); border-radius: 10px; overflow: hidden; background: var(--vscode-editor-background); transition: box-shadow 0.2s; }
-    .finding-card:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.15); }
-
-    /* Card header (always visible, clickable) */
-    .card-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; cursor: pointer; user-select: none; background: var(--vscode-editor-inactiveSelectionBackground); }
-    .card-header:hover { background: var(--vscode-list-hoverBackground); }
-    .card-header-left { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    .card-header-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-    .sev-pill { padding: 3px 10px; border-radius: 100px; font-size: 11px; font-weight: 700; border: 1px solid; white-space: nowrap; }
-    .card-title { font-weight: 600; font-size: 0.95em; }
-    .card-sub { font-size: 0.8em; color: var(--vscode-descriptionForeground); }
-    .conf-badge { font-size: 11px; color: var(--vscode-descriptionForeground); }
-    .toggle-icon { font-size: 12px; color: var(--vscode-descriptionForeground); transition: transform 0.2s; display: inline-block; }
-    .toggle-icon.open { transform: rotate(180deg); }
-
-    /* Headline (always visible below header) */
-    .card-headline { padding: 10px 18px 12px; font-size: 0.88em; color: var(--vscode-descriptionForeground); border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
-
-    /* Expandable detail */
-    .card-detail { display: none; padding: 18px; }
-    .card-detail.open { display: block; }
-
-    .detail-section { margin-bottom: 18px; }
-    .detail-label { font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--vscode-descriptionForeground); margin-bottom: 8px; }
-    .detail-text { font-size: 0.9em; }
-
-    /* Side-by-side code comparison */
-    .code-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
-    @media (max-width: 700px) { .code-compare { grid-template-columns: 1fr; } }
-    .code-col {}
-    .code-label { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; padding: 6px 12px; }
-    .danger-label { background: #f14c4c1a; color: #f14c4c; border-radius: 6px 6px 0 0; }
-    .safe-label   { background: #73c9911a; color: #73c991; border-radius: 6px 6px 0 0; }
-    pre { font-family: 'Fira Code', 'Courier New', monospace; font-size: 12px; padding: 12px 14px; background: var(--vscode-textCodeBlock-background); overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
-    .pre-danger { border: 1px solid #f14c4c33; border-radius: 0 0 6px 6px; }
-    .pre-safe   { border: 1px solid #73c99133; border-radius: 0 0 6px 6px; }
-
-    /* Attack box */
-    .attack-box { background: #e9a82511; border: 1px solid #e9a82533; border-radius: 8px; padding: 12px 14px; font-size: 0.85em; white-space: pre-wrap; font-family: 'Fira Code', monospace; }
-
-    /* Fix note */
-    .fix-note { background: #73c99111; border: 1px solid #73c99133; border-radius: 8px; padding: 11px 14px; font-size: 0.88em; margin-top: 8px; }
-
-    .empty-state { text-align: center; padding: 48px; color: #73c991; }
-    .empty-state .check { font-size: 3em; margin-bottom: 12px; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src ${cspSource} data:; script-src 'unsafe-inline';">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.6;min-height:100vh}
+.hero{background:linear-gradient(135deg,#0d1117 0%,#161b22 55%,#1a1f2e 100%);border-bottom:1px solid rgba(255,255,255,.08);padding:22px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo-box{width:38px;height:38px;background:linear-gradient(135deg,#1f6feb,#388bfd);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:19px;box-shadow:0 0 14px rgba(88,166,255,.3);flex-shrink:0}
+.logo-img{width:38px;height:38px;object-fit:contain;border-radius:8px}
+.bname{font-size:1.35em;font-weight:800;letter-spacing:-.4px;color:#e6edf3}
+.bsub{font-size:.67em;font-weight:500;color:#8b949e;text-transform:uppercase;letter-spacing:1.3px;margin-top:1px}
+.sess{display:flex;align-items:center;gap:6px;background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.22);border-radius:100px;padding:5px 12px;font-size:.69em;color:#58a6ff;white-space:nowrap;font-family:'Courier New',monospace}
+.dot{width:6px;height:6px;border-radius:50%;background:#3fb950;box-shadow:0 0 6px #3fb950;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.wrap{padding:22px 28px}
+.mrow{display:grid;grid-template-columns:auto 1fr;gap:14px;margin-bottom:26px;align-items:stretch}
+.scard{background:#161b22;border:1px solid rgba(255,255,255,.08);border-radius:13px;padding:20px 22px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;min-width:155px}
+.rw{position:relative;width:106px;height:106px}
+.rw svg{transform:rotate(-90deg);width:106px;height:106px}
+.rbg{fill:none;stroke:rgba(255,255,255,.06);stroke-width:9}
+.rfg{fill:none;stroke:${scoreColor};stroke-width:9;stroke-linecap:round;stroke-dasharray:${circumference};stroke-dashoffset:${circumference};animation:rng 1.2s cubic-bezier(.4,0,.2,1) forwards .15s}
+@keyframes rng{to{stroke-dashoffset:${dashOffset}}}
+.rlbl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.rnum{font-size:1.6em;font-weight:800;color:${scoreColor};line-height:1}
+.rsub{font-size:.58em;color:#8b949e;font-weight:500}
+.sttl{font-size:.67em;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#8b949e}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:9px}
+.stat{background:#161b22;border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:15px 13px;display:flex;flex-direction:column;gap:4px;transition:border-color .2s,transform .15s;cursor:default}
+.stat:hover{border-color:rgba(255,255,255,.16);transform:translateY(-2px)}
+.sico{font-size:.95em}
+.snum{font-size:1.85em;font-weight:800;line-height:1;letter-spacing:-1px}
+.slbl{font-size:.63em;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.7px}
+.shdr{display:flex;align-items:center;gap:8px;margin-bottom:13px}
+.stxt{font-size:.7em;font-weight:700;text-transform:uppercase;letter-spacing:1.1px;color:#8b949e}
+.shdr::after{content:'';flex:1;height:1px;background:rgba(255,255,255,.08)}
+.cbadge{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:100px;font-size:.67em;font-weight:600;padding:2px 8px;color:#8b949e}
+.cards{display:flex;flex-direction:column;gap:9px}
+.card{background:#161b22;border:1px solid rgba(255,255,255,.08);border-radius:11px;overflow:hidden;transition:border-color .2s,box-shadow .2s,transform .15s}
+.card:hover{border-color:rgba(255,255,255,.15);box-shadow:0 4px 18px rgba(0,0,0,.35);transform:translateY(-1px)}
+.card-hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;cursor:pointer;user-select:none;background:#1c2128;transition:background .15s}
+.card-hdr:hover{background:rgba(255,255,255,.04)}
+.lft{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.rgt{display:flex;align-items:center;gap:7px;flex-shrink:0}
+.pill{padding:3px 9px;border-radius:100px;font-size:9.5px;font-weight:700;letter-spacing:.5px;white-space:nowrap}
+.ctitle{font-weight:700;font-size:.87em;color:#e6edf3}
+.cfile{font-size:.7em;color:#8b949e;margin-top:1px}
+.conf{font-size:.69em;font-weight:600;color:#8b949e;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:100px;padding:2px 7px}
+.chev{font-size:10px;color:#484f58;transition:transform .22s ease;display:inline-block}
+.chev.open{transform:rotate(180deg)}
+.chl{padding:8px 15px 10px;font-size:.8em;color:#8b949e;border-top:1px solid rgba(255,255,255,.08)}
+.cbody{display:none;padding:16px 15px;border-top:1px solid rgba(255,255,255,.08);background:#0d1117}
+.cbody.open{display:block;animation:sl .18s ease}
+@keyframes sl{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}
+.dlbl{font-size:.66em;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#8b949e;margin-bottom:6px;margin-top:13px}
+.dlbl:first-child{margin-top:0}
+.dtxt{font-size:.84em;color:#e6edf3}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:9px 0 3px}
+.clbl{font-size:.63em;font-weight:700;letter-spacing:.7px;text-transform:uppercase;padding:4px 9px;border-radius:5px 5px 0 0}
+.dlbl-d{background:rgba(244,112,103,.12);color:#f47067}
+.dlbl-s{background:rgba(63,185,80,.1);color:#3fb950}
+pre{font-family:'Cascadia Code','Fira Code','Courier New',monospace;font-size:11px;padding:10px 11px;background:rgba(0,0,0,.35);border-radius:0 0 5px 5px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;color:#e6edf3}
+.pre-d{border:1px solid rgba(244,112,103,.22);border-top:none}
+.pre-s{border:1px solid rgba(63,185,80,.17);border-top:none}
+.atk{background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.2);border-radius:7px;padding:9px 11px;font-size:.79em;white-space:pre-wrap;font-family:'Cascadia Code','Fira Code','Courier New',monospace;color:#d29922;margin-bottom:3px}
+.fix{background:rgba(63,185,80,.07);border:1px solid rgba(63,185,80,.16);border-radius:7px;padding:9px 11px;font-size:.82em;color:#3fb950;margin-top:9px}
+.empty{text-align:center;padding:56px 20px;color:#8b949e}
+.eico{font-size:3em;margin-bottom:11px;filter:drop-shadow(0 0 16px rgba(63,185,80,.5))}
+.ettl{font-size:1.02em;font-weight:700;color:#3fb950;margin-bottom:4px}
+.esub{font-size:.82em}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.18)}
+@media(max-width:580px){.mrow{grid-template-columns:1fr}.cmp{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-  <div class="dash-header">
-    <div class="dash-title">
-      ${logoUri
-        ? `<img src="${logoUri}" alt="Sentinel" class="dash-logo">`
-        : ''}
-      <div class="dash-title-text">
-        <div class="dash-title-main">Sentinel</div>
-        <div class="dash-title-sub">Security Dashboard</div>
+<div class="hero">
+  <div class="brand">
+    ${logoUri ? `<img src="${logoUri}" alt="Sentinel" class="logo-img">` : `<div class="logo-box">&#x1F6E1;</div>`}
+    <div>
+      <div class="bname">Sentinel</div>
+      <div class="bsub">Security Dashboard</div>
+    </div>
+  </div>
+  <div class="sess"><span class="dot"></span>${escHtml(eventClient?.getSessionId() ?? 'N/A')}</div>
+</div>
+<div class="wrap">
+  <div class="mrow">
+    <div class="scard">
+      <div class="rw">
+        <svg viewBox="0 0 106 106">
+          <circle class="rbg" cx="53" cy="53" r="44"/>
+          <circle class="rfg" cx="53" cy="53" r="44"/>
+        </svg>
+        <div class="rlbl">
+          <span class="rnum">${scoreRaw}</span>
+          <span class="rsub">/ 100</span>
+        </div>
       </div>
+      <div class="sttl">Security Score</div>
     </div>
-    <div class="dash-session">Session: ${eventClient?.getSessionId() ?? 'N/A'}</div>
-  </div>
-
-  <!-- Stat cards -->
-  <div class="stats">
-    <div class="stat">
-      <div class="stat-num" style="color:${scoreColor}">${scoreRaw}%</div>
-      <div class="stat-label">Security Score</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num" style="color:#f14c4c">${summary.criticalCount}</div>
-      <div class="stat-label">Critical</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num" style="color:#f17c4c">${summary.highCount}</div>
-      <div class="stat-label">High</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num" style="color:#e9a825">${summary.mediumCount}</div>
-      <div class="stat-label">Medium</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num">${summary.totalFindings}</div>
-      <div class="stat-label">Total Issues</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num">${analyzer?.getRules().length ?? 0}</div>
-      <div class="stat-label">Active Rules</div>
+    <div class="sgrid">
+      <div class="stat"><div class="sico">&#x1F6A8;</div><div class="snum" style="color:#f47067">${summary.criticalCount}</div><div class="slbl">Critical</div></div>
+      <div class="stat"><div class="sico">&#x1F534;</div><div class="snum" style="color:#f0883e">${summary.highCount}</div><div class="slbl">High</div></div>
+      <div class="stat"><div class="sico">&#x1F7E0;</div><div class="snum" style="color:#d29922">${summary.mediumCount}</div><div class="slbl">Medium</div></div>
+      <div class="stat"><div class="sico">&#x1F4CB;</div><div class="snum">${summary.totalFindings}</div><div class="slbl">Total</div></div>
+      <div class="stat"><div class="sico">&#x2699;&#xFE0F;</div><div class="snum" style="color:#58a6ff">${analyzer?.getRules().length ?? 0}</div><div class="slbl">Rules</div></div>
     </div>
   </div>
-
-  <!-- Finding cards with contextual explanation -->
-  <div class="section-title">Detected Vulnerabilities</div>
-
+  <div class="shdr">
+    <span class="stxt">Detected Vulnerabilities</span>
+    <span class="cbadge">${findings.length}</span>
+  </div>
   ${findings.length === 0
-    ? `<div class="empty-state"><div class="check">✅</div><div>No issues detected in open files.</div></div>`
-    : `<div class="findings">${findingCards}</div>`
-  }
-
-  <script>
-    function toggleCard(id) {
-      const detail = document.getElementById('detail-' + id);
-      const icon   = document.getElementById('icon-' + id);
-      if (!detail || !icon) return;
-      const isOpen = detail.classList.contains('open');
-      detail.classList.toggle('open', !isOpen);
-      icon.classList.toggle('open', !isOpen);
-    }
-    // Auto-expand the first card
-    const firstCard = document.querySelector('.card-header');
-    if (firstCard) {
-      const id = firstCard.parentElement?.id?.replace('card-', '');
-      if (id) toggleCard(id);
-    }
-  <\/script>
+    ? `<div class="empty"><div class="eico">&#x2705;</div><div class="ettl">All Clear</div><div class="esub">No vulnerabilities detected in open files.</div></div>`
+    : `<div class="cards">${findingCards}</div>`}
+</div>
+<script>
+function tog(id){
+  var b=document.getElementById('body-'+id),c=document.getElementById('chev-'+id);
+  if(!b||!c)return;
+  var o=b.classList.contains('open');
+  b.classList.toggle('open',!o);
+  c.classList.toggle('open',!o);
+}
+var h=document.querySelector('.card-hdr');
+if(h){var el=h.parentElement;if(el&&el.id)tog(el.id.replace('card-',''));}
+</script>
 </body>
 </html>`;
 }
-
 function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
