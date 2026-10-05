@@ -517,7 +517,7 @@ function refreshDashboard(): void {
   const allFindings: SecurityFinding[] = [];
   for (const findings of findingsCache.values()) { allFindings.push(...findings); }
   const summary = analyzer.summarize(allFindings);
-  const dataDir = path.join(extensionContext.extensionPath, 'src', 'DATA');
+  const dataDir = path.join(extensionContext.extensionPath, 'src', 'data');
 
   if (session.role === 'developer') {
     dashboardPanel.title = `Sentinel — ${session.displayName}`;

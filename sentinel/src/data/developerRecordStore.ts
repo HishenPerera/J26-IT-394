@@ -87,7 +87,7 @@ export class DeveloperRecordStore {
    */
   constructor(extensionRootPath: string) {
     // DATA folder sits alongside src/ in the extension root
-    this.dataDir = path.join(extensionRootPath, 'src', 'DATA');
+    this.dataDir = path.join(extensionRootPath, 'src', 'data');
     this.ensureDataDir();
   }
 

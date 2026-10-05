@@ -96,7 +96,7 @@ export class ProjectStore {
   private sessions: ShiftSession[] = [];
 
   constructor(extensionPath: string) {
-    this.dataDir = path.join(extensionPath, 'src', 'DATA');
+    this.dataDir = path.join(extensionPath, 'src', 'data');
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
