@@ -11,6 +11,9 @@
     "Linters",
     "Other"
   ],
+  "extensionDependencies": [
+    "vscode.github-authentication"
+  ],
   "keywords": [
     "security",
     "vulnerability",
@@ -23,6 +26,12 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "authentication": [
+      {
+        "id": "github",
+        "label": "GitHub"
+      }
+    ],
     "commands": [
       {
         "command": "sentinel.showDashboard",
@@ -73,7 +82,19 @@
         "sentinel.enableAI": {
           "type": "boolean",
           "default": false,
-          "description": "Enable AI-assisted vulnerability analysis (Phase 7)"
+          "description": "Enable AI-assisted vulnerability analysis via the Intelligent Feedback Engine (IFE)"
+        },
+        "sentinel.ifeUrl": {
+          "type": "string",
+          "default": "http://localhost:4000",
+          "description": "URL of the Intelligent Feedback Engine (Component 3) for AI-generated explanations and personalised fixes"
+        },
+        "sentinel.minConfidence": {
+          "type": "number",
+          "default": 0.70,
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Minimum detection confidence threshold (0.0–1.0). Findings below this score are hidden. Lower = more alerts, higher = fewer but more precise."
         }
       }
     }

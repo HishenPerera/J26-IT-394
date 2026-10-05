@@ -59,8 +59,16 @@ const loginView_js_1 = require("./webview/loginView.js");
 const developerDashboard_js_1 = require("./webview/developerDashboard.js");
 const supervisorDashboard_js_1 = require("./webview/supervisorDashboard.js");
 const adminDashboard_js_1 = require("./webview/adminDashboard.js");
+const aiEnhancedAnalyzer_js_1 = require("./ai/aiEnhancedAnalyzer.js");
+const developerLearningStore_js_1 = require("./ai/developerLearningStore.js");
+const projectStore_js_1 = require("./data/projectStore.js");
 // ─── Module-level instances (kept alive for the extension lifetime) ─────────
 let analyzer;
+let aiAnalyzer;
+let learningStore;
+let projectStore;
+/** ID of the currently active ShiftSession (null = no shift in progress) */
+let activeShiftSessionId = null;
 let diagnosticManager;
 let eventClient;
 let recordStore;
@@ -86,9 +94,31 @@ function activate(context) {
     eventClient = new securityEventClient_js_1.SecurityEventClient();
     // Initialise developer record store — persists findings to src/DATA/<developerId>_vulnerability_records.json
     recordStore = new developerRecordStore_js_1.DeveloperRecordStore(context.extensionPath);
+    // Initialise the Developer Learning Store — persists per-developer mistake learning data
+    learningStore = new developerLearningStore_js_1.DeveloperLearningStore(context.extensionPath);
+    log('🧠 Developer learning store initialised.');
+    // Initialise the AI-Enhanced Analyzer — wraps base analyzer with learning filters + IFE enrichment
+    aiAnalyzer = new aiEnhancedAnalyzer_js_1.AIEnhancedAnalyzer(analyzer, learningStore);
+    log('🤖 AI-enhanced analyzer initialised.');
+    // Initialise Project Store — Projects, Shifts, ShiftSessions
+    projectStore = new projectStore_js_1.ProjectStore(context.extensionPath);
+    log('📁 Project store initialised.');
     // Initialise auth manager — role-based login system
     authManager = new authManager_js_1.AuthManager(context);
     log('🔐 Auth manager initialised.');
+    // ── Silently restore GitHub session (no prompt shown) ────────────────────────
+    // If the developer was previously signed in via GitHub, restore their
+    // session automatically. Only runs if no session already exists in state.
+    if (!authManager.isLoggedIn()) {
+        authManager.refreshGitHubSession().then(session => {
+            if (session) {
+                log(`👋 Auto-restored GitHub session: ${session.githubUsername ?? session.username} (${session.role})`);
+                refreshDashboard();
+            }
+        }).catch(() => {
+            // Silent refresh failed — user will see login screen
+        });
+    }
     // ── Register commands ────────────────────────────────────────────────────
     context.subscriptions.push(vscode.commands.registerCommand('sentinel.showOutput', () => {
         outputChannel.show();
@@ -199,30 +229,83 @@ async function analyzeDocument(document, forceNotify) {
     const text = document.getText();
     const fileName = document.uri.fsPath;
     const languageId = document.languageId;
-    const findings = analyzer.analyze(text, fileName, languageId);
+    // Resolve developer ID (GitHub username → config → fallback)
+    const developerId = await resolveDeveloperId();
+    const sessionId = eventClient.getSessionId();
+    const ifeEnabled = config.get('enableAI', false);
+    const ifeUrl = config.get('ifeUrl', 'http://localhost:4000');
+    const minConfidence = config.get('minConfidence', 0.70);
+    const aiConfig = {
+        developerId,
+        sessionId,
+        ifeUrl,
+        ifeEnabled,
+        minConfidence,
+    };
+    // ── Step 1: Analyze + apply learning filters (synchronous) ──────────────
+    const findings = aiAnalyzer.analyze(text, fileName, languageId, aiConfig);
     const summary = analyzer.summarize(findings);
-    // Update Problems panel
+    // ── Step 2: Show diagnostics immediately (don't wait for AI) ────────────
     diagnosticManager.updateDiagnostics(document, findings);
-    // Cache findings for code actions
     findingsCache.set(document.uri.toString(), findings);
-    // Log to output channel
     if (findings.length > 0 || forceNotify) {
         logFindings(document, findings);
     }
-    // Report to backend (Phase 5)
+    // ── Step 3: Record DETECTED events in learning store + active shift session
+    for (const finding of findings) {
+        aiAnalyzer.recordDetection(finding, developerId);
+        // Forward finding to the active shift session (if one is running)
+        if (activeShiftSessionId) {
+            const sf = {
+                id: finding.id,
+                type: finding.type,
+                severity: finding.severity,
+                confidence: finding.confidence,
+                fileName: finding.fileName,
+                lineNumber: finding.lineNumber,
+                codeSnippet: finding.codeSnippet,
+                detectedAt: finding.detectedAt,
+                ruleId: finding.detectedByRule ?? 'unknown',
+            };
+            projectStore.addFindingToSession(activeShiftSessionId, sf);
+        }
+    }
+    // ── Step 4: Report to backend (behaviour tracker) ───────────────────────
     for (const finding of findings) {
         void eventClient.reportDetection(finding);
     }
-    // Persist developer vulnerability record to DATA/ (JSON)
+    // ── Step 5: Persist developer vulnerability record to DATA/ ─────────────
     for (const finding of findings) {
-        void recordStore.save(finding, eventClient.getSessionId());
+        void recordStore.save(finding, sessionId);
     }
-    // Show terminal alert for HIGH/CRITICAL findings
+    // ── Step 6: Show terminal alert for HIGH/CRITICAL findings ──────────────
     if (findings.some(f => f.severity === 'HIGH' || f.severity === 'CRITICAL')) {
         logSecurityAlert(findings.filter(f => f.severity === 'HIGH' || f.severity === 'CRITICAL'));
     }
-    // Push updated data to the live dashboard (if it's open)
     refreshDashboard();
+    // ── Step 7: Async AI enrichment via IFE (non-blocking) ──────────────────
+    if (ifeEnabled && findings.length > 0) {
+        aiAnalyzer.enrich(findings, aiConfig).then(enriched => {
+            // Show escalation notification for the most severe AI-enriched finding
+            const topEnriched = enriched.find(f => f.escalationMessage);
+            if (topEnriched && topEnriched.escalationMessage) {
+                const ef = topEnriched;
+                const msgPrefix = ef.feedbackLevel === 'CRITICAL_PATTERN' ? '🚨' :
+                    ef.feedbackLevel === 'PERSISTENT' ? '⚠️' :
+                        ef.feedbackLevel === 'REPEATED' ? '🔁' : '💡';
+                vscode.window.showWarningMessage(`${msgPrefix} Sentinel AI: ${ef.escalationMessage}`, 'View Explanation').then(selection => {
+                    if (selection === 'View Explanation') {
+                        handleExplainAction(topEnriched.id);
+                    }
+                });
+            }
+            // Update cache with enriched findings so hover provider can use AI text
+            findingsCache.set(document.uri.toString(), enriched);
+            log(`[AI] Enriched ${enriched.filter((f) => f.aiGenerated).length} findings with AI explanations.`);
+        }).catch(err => {
+            log(`[AI] Enrichment failed: ${err}`);
+        });
+    }
 }
 // ─── Developer Action Handlers ────────────────────────────────────────────────
 function handleExplainAction(findingId) {
@@ -248,6 +331,11 @@ function handleFixAction(findingId) {
     }
     void eventClient.reportAction(finding, types_js_1.DeveloperAction.SECURE_EXAMPLE_VIEWED);
     log(`[Action] SECURE_EXAMPLE_VIEWED — ${finding.type} at line ${finding.lineNumber}`);
+    // ── Learning feedback: developer viewed the fix (treat as intent to fix) ──
+    resolveDeveloperId().then(developerId => {
+        aiAnalyzer.recordAction(finding, 'FIXED', developerId);
+        log(`[AI Learning] Recorded FIXED for ${finding.type} (dev: ${developerId})`);
+    });
 }
 function handleIgnoreAction(findingId) {
     const finding = findFindingById(findingId);
@@ -258,6 +346,11 @@ function handleIgnoreAction(findingId) {
         `This finding will reappear if the code is not fixed.`);
     void eventClient.reportAction(finding, types_js_1.DeveloperAction.IGNORED);
     log(`[Action] IGNORED — ${finding.type} at line ${finding.lineNumber}`);
+    // ── Learning feedback: developer dismissed this finding ─────────────────
+    resolveDeveloperId().then(developerId => {
+        aiAnalyzer.recordAction(finding, 'IGNORED', developerId);
+        log(`[AI Learning] Recorded IGNORED for ${finding.type} (dev: ${developerId})`);
+    });
 }
 function findFindingById(findingId) {
     for (const findings of findingsCache.values()) {
@@ -267,6 +360,23 @@ function findFindingById(findingId) {
         }
     }
     return undefined;
+}
+/**
+ * Resolve the current developer ID.
+ * Priority: GitHub username → sentinel.developerId config → 'DEV_UNKNOWN'
+ */
+async function resolveDeveloperId() {
+    try {
+        const session = await vscode.authentication.getSession('github', ['user:email'], { silent: true });
+        if (session?.account?.label) {
+            return session.account.label;
+        }
+    }
+    catch {
+        // GitHub auth not available — fall through
+    }
+    const config = vscode.workspace.getConfiguration('sentinel');
+    return config.get('developerId', 'DEV_UNKNOWN');
 }
 // ─── Code Actions Provider ────────────────────────────────────────────────────
 class SentinelCodeActionProvider {
@@ -279,29 +389,17 @@ class SentinelCodeActionProvider {
                 continue;
             }
             const explainAction = new vscode.CodeAction(`$(book) Sentinel: Explain ${finding.type}`, vscode.CodeActionKind.QuickFix);
-            explainAction.command = {
-                command: 'sentinel.explainFinding',
-                title: 'Explain',
-                arguments: [{ findingId: finding.id }],
-            };
+            explainAction.command = { command: 'sentinel.explainFinding', title: 'Explain', arguments: [{ findingId: finding.id }] };
             const fixAction = new vscode.CodeAction(`$(wrench) Sentinel: Show Secure Fix for ${finding.type}`, vscode.CodeActionKind.QuickFix);
-            fixAction.command = {
-                command: 'sentinel.applyFix',
-                title: 'Show Fix',
-                arguments: [{ findingId: finding.id }],
-            };
+            fixAction.command = { command: 'sentinel.applyFix', title: 'Show Fix', arguments: [{ findingId: finding.id }] };
             const ignoreAction = new vscode.CodeAction(`$(eye-closed) Sentinel: Ignore this ${finding.type} warning`, vscode.CodeActionKind.QuickFix);
-            ignoreAction.command = {
-                command: 'sentinel.ignoreFinding',
-                title: 'Ignore',
-                arguments: [{ findingId: finding.id }],
-            };
+            ignoreAction.command = { command: 'sentinel.ignoreFinding', title: 'Ignore', arguments: [{ findingId: finding.id }] };
             actions.push(explainAction, fixAction, ignoreAction);
         }
         return actions;
     }
 }
-// ─── Dashboard Webview ────────────────────────────────────────────────────────
+// ─── Dashboard Webview ──────────────────────────────────────────────────────────────
 /**
  * Refresh the live dashboard panel.
  * - If no session → show login screen.
@@ -315,12 +413,10 @@ function refreshDashboard() {
     const cspSource = dashboardPanel.webview.cspSource;
     const session = authManager?.getSession();
     if (!session) {
-        // Not logged in — show login screen
         dashboardPanel.title = 'Sentinel — Login';
         dashboardPanel.webview.html = (0, loginView_js_1.buildLoginHtml)(cspSource, logoUri);
         return;
     }
-    // ── Route to role-specific dashboard ──────────────────────────────────────
     const allFindings = [];
     for (const findings of findingsCache.values()) {
         allFindings.push(...findings);
@@ -329,11 +425,26 @@ function refreshDashboard() {
     const dataDir = path.join(extensionContext.extensionPath, 'src', 'DATA');
     if (session.role === 'developer') {
         dashboardPanel.title = `Sentinel — ${session.displayName}`;
-        dashboardPanel.webview.html = (0, developerDashboard_js_1.buildDeveloperDashboardHtml)(summary, allFindings, session, logoUri, cspSource, analyzer.getRules().length, eventClient?.getSessionId() ?? 'N/A');
+        const devId = session.githubUsername ?? session.username;
+        const assignedShifts = projectStore.getShiftsForDeveloper(devId);
+        const activeSession = projectStore.getActiveSession(devId);
+        const recentSessions = projectStore.getSessionsForDeveloper(devId);
+        dashboardPanel.webview.html = (0, developerDashboard_js_1.buildDeveloperDashboardHtml)(summary, allFindings, session, logoUri, cspSource, analyzer.getRules().length, eventClient?.getSessionId() ?? 'N/A', assignedShifts, activeSession, recentSessions);
     }
     else if (session.role === 'supervisor') {
         dashboardPanel.title = 'Sentinel — Supervisor Dashboard';
-        dashboardPanel.webview.html = (0, supervisorDashboard_js_1.buildSupervisorDashboardHtml)(session, dataDir, cspSource, logoUri);
+        const supId = session.githubUsername ?? session.username;
+        const projects = projectStore.getProjects(supId);
+        const shifts = projectStore.getShifts();
+        const allUsers = authManager.getAllUsers()
+            .filter(u => u.role === 'developer')
+            .map(u => ({
+            id: u.id, username: u.username, displayName: u.displayName,
+            githubUsername: u.githubUsername,
+            githubAvatarUrl: u.githubAvatarUrl,
+        }));
+        const allSessions = projectStore.getAllSessions();
+        dashboardPanel.webview.html = (0, supervisorDashboard_js_1.buildSupervisorDashboardHtml)(session, dataDir, cspSource, logoUri, projects, shifts, allUsers, allSessions);
     }
     else if (session.role === 'administrator') {
         dashboardPanel.title = 'Sentinel — Admin Dashboard';
@@ -367,6 +478,89 @@ function showDashboard(context) {
 // ─── Webview Message Handler ──────────────────────────────────────────────────
 function handleWebviewMessage(message) {
     switch (message.command) {
+        case 'CREATE_PROJECT': {
+            const session = authManager.getSession();
+            if (!session) {
+                break;
+            }
+            const project = projectStore.createProject(message.name, message.description, session.githubUsername ?? session.username, session.displayName);
+            log(`📁 Project created: "${project.name}" (${project.id})`);
+            refreshDashboard();
+            break;
+        }
+        case 'CREATE_SHIFT': {
+            const shift = projectStore.createShift(message.projectId, message.name, message.description, message.scheduledStart, message.scheduledEnd, message.developerIds ?? [], message.developerNames ?? [], authManager.getSession()?.username ?? 'unknown');
+            if (shift) {
+                log(`📅 Shift created: "${shift.name}" in project ${shift.projectId}`);
+                refreshDashboard();
+            }
+            break;
+        }
+        case 'UPDATE_SHIFT_ASSIGNMENT': {
+            projectStore.updateShiftAssignments(message.shiftId, message.developerIds ?? [], message.developerNames ?? []);
+            log(`👥 Updated assignments for shift ${message.shiftId}`);
+            refreshDashboard();
+            break;
+        }
+        case 'START_SHIFT': {
+            const authSession = authManager.getSession();
+            if (!authSession) {
+                break;
+            }
+            const shift = projectStore.getShift(message.shiftId);
+            if (!shift) {
+                break;
+            }
+            const developerId = authSession.githubUsername ?? authSession.username;
+            const shiftSession = projectStore.startSession(shift, developerId, authSession.username, authSession.displayName, authSession.githubAvatarUrl);
+            activeShiftSessionId = shiftSession.id;
+            log(`▶ Shift started: "${shift.name}" by ${authSession.displayName} (session: ${shiftSession.id})`);
+            vscode.window.showInformationMessage(`🟢 Shift "${shift.name}" started! Sentinel is now tracking your vulnerabilities.`);
+            refreshDashboard();
+            break;
+        }
+        case 'END_SHIFT': {
+            const sessionId = message.sessionId;
+            const endedSession = projectStore.endSession(sessionId);
+            activeShiftSessionId = null;
+            if (endedSession?.summary) {
+                const sum = endedSession.summary;
+                const sc = sum.securityScore;
+                const icon = sc >= 80 ? '🌟' : sc >= 50 ? '⚠️' : '🚨';
+                vscode.window.showInformationMessage(`${icon} Shift ended! Security Score: ${sc}/100 — ${sum.totalFindings} vulnerabilities detected. Check your Reports tab.`, 'View Report').then(sel => {
+                    if (sel === 'View Report') {
+                        showDashboard(extensionContext);
+                    }
+                });
+                log(`⏹ Shift ended: session ${sessionId} — score: ${sc}, findings: ${sum.totalFindings}`);
+            }
+            refreshDashboard();
+            break;
+        }
+        case 'GITHUB_LOGIN': {
+            // Triggered when the user clicks "Continue with GitHub" in the webview.
+            // This calls VS Code's OAuth flow — shows the system browser auth prompt.
+            authManager.loginWithGitHub(false).then(session => {
+                if (session) {
+                    log(`👋 GitHub login: @${session.githubUsername ?? session.username} (${session.role})`);
+                    refreshDashboard();
+                }
+                else {
+                    // User cancelled or GitHub auth failed — re-show login with error
+                    if (dashboardPanel) {
+                        const logoUri = dashboardPanel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'resources', 'sentinel-logo.png')).toString();
+                        dashboardPanel.webview.html = (0, loginView_js_1.buildLoginHtml)(dashboardPanel.webview.cspSource, logoUri, '', 'GitHub sign-in was cancelled or failed. Please try again.');
+                    }
+                }
+            }).catch(err => {
+                log(`[Auth] GitHub login error: ${err}`);
+                if (dashboardPanel) {
+                    const logoUri = dashboardPanel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'resources', 'sentinel-logo.png')).toString();
+                    dashboardPanel.webview.html = (0, loginView_js_1.buildLoginHtml)(dashboardPanel.webview.cspSource, logoUri, '', 'GitHub authentication failed. Check your internet connection.');
+                }
+            });
+            break;
+        }
         case 'LOGIN': {
             const session = authManager.login(message.username, message.password);
             if (session) {

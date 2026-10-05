@@ -1,0 +1,20 @@
+[
+  {
+    "id": "shift-1790956132842",
+    "projectId": "proj-1790956053054",
+    "projectName": "Test",
+    "name": "Sht1",
+    "description": "ad",
+    "scheduledStart": "2019-02-12T18:02:00.000Z",
+    "scheduledEnd": "2026-10-02T15:48:00.000Z",
+    "assignedDeveloperIds": [
+      "HishenPerera"
+    ],
+    "assignedDeveloperNames": [
+      "Hishen Sandaru Perera"
+    ],
+    "status": "completed",
+    "createdAt": "2026-10-02T15:48:52.842Z",
+    "createdBy": "supervisor01"
+  }
+]

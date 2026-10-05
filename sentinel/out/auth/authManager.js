@@ -1,13 +1,18 @@
 "use strict";
 /**
- * Sentinel — Auth Manager
+ * Sentinel — Auth Manager  (v2 — GitHub OAuth + Password fallback)
  *
- * Handles credential verification and session management for the
- * role-based login system. Uses Node.js built-in `crypto` (SHA-256)
- * — no external dependencies required.
+ * Authentication flow:
+ *   PRIMARY  → GitHub OAuth via VS Code's built-in authentication provider.
+ *              On success, fetches the GitHub user profile, auto-provisions
+ *              a local user record (role = 'developer' for new accounts),
+ *              and creates an AuthSession enriched with GitHub metadata.
  *
- * Roles: developer | supervisor | administrator
- * Sessions: stored in ExtensionContext.workspaceState
+ *   FALLBACK → Username + SHA-256 password hash against users.json.
+ *              Used by supervisors and administrators who may not have GitHub.
+ *
+ * Sessions are persisted to workspaceState so they survive panel close/reopen.
+ * GitHub sessions are refreshed silently on every activation.
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -47,8 +52,13 @@ exports.AuthManager = void 0;
 const crypto = __importStar(require("crypto"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const vscode = __importStar(require("vscode"));
 const SESSION_KEY = 'sentinel.authSession';
 const USERS_FILE = 'users.json';
+// GitHub OAuth scopes we need:
+//   read:user  → access profile (login, name, avatar)
+//   user:email → access primary email
+const GITHUB_SCOPES = ['read:user', 'user:email'];
 // ─── AuthManager ──────────────────────────────────────────────────────────────
 class AuthManager {
     constructor(context) {
@@ -56,6 +66,102 @@ class AuthManager {
         this.users = [];
         this.dataDir = path.join(context.extensionPath, 'src', 'data');
         this.loadUsers();
+    }
+    // ── GitHub OAuth Authentication ──────────────────────────────────────────────
+    /**
+     * Attempt to authenticate via GitHub OAuth.
+     *
+     * Behaviour:
+     *   - If `silent = true`, tries to reuse an existing GitHub session without
+     *     showing a UI prompt. Used during activate() to restore login state.
+     *   - If `silent = false`, shows the VS Code "Sign in with GitHub" prompt.
+     *
+     * On success:
+     *   1. Fetches the GitHub user profile via the REST API.
+     *   2. Auto-provisions a local user record if none exists for this GitHub login.
+     *   3. Updates the cached avatar URL and display name.
+     *   4. Persists the AuthSession.
+     *
+     * @returns The new AuthSession on success, or null on failure/cancellation.
+     */
+    async loginWithGitHub(silent = false) {
+        try {
+            const vsSession = await vscode.authentication.getSession('github', GITHUB_SCOPES, { silent, createIfNone: !silent });
+            if (!vsSession) {
+                return null; // User cancelled or silent refresh found nothing
+            }
+            const profile = await this.fetchGitHubProfile(vsSession.accessToken);
+            if (!profile) {
+                return null;
+            }
+            // Find or auto-provision a local user for this GitHub account
+            const user = this.findOrProvisionGitHubUser(profile);
+            const session = {
+                userId: user.id,
+                username: user.username,
+                displayName: profile.name ?? profile.login,
+                role: user.role,
+                email: profile.email ?? user.email,
+                loggedInAt: new Date().toISOString(),
+                authMethod: 'github',
+                githubUsername: profile.login,
+                githubAvatarUrl: profile.avatar_url,
+                githubName: profile.name ?? profile.login,
+                githubAccessToken: vsSession.accessToken,
+            };
+            await this.context.workspaceState.update(SESSION_KEY, session);
+            console.log(`[AuthManager] GitHub login: ${profile.login} → role: ${user.role}`);
+            return session;
+        }
+        catch (err) {
+            // User dismissed the sign-in dialog
+            if (err?.message?.includes('User did not consent')) {
+                return null;
+            }
+            console.error('[AuthManager] GitHub login error:', err);
+            return null;
+        }
+    }
+    /**
+     * Silently refresh GitHub session on extension activate.
+     * Restores the active session without prompting if one already exists.
+     */
+    async refreshGitHubSession() {
+        return this.loginWithGitHub(true);
+    }
+    // ── Password Authentication (fallback) ──────────────────────────────────────
+    /**
+     * Authenticate with username + password (SHA-256).
+     * Used for supervisor and administrator accounts.
+     */
+    login(username, password) {
+        this.loadUsers();
+        const hash = AuthManager.hashPassword(password);
+        const user = this.users.find(u => u.username === username && u.passwordHash === hash);
+        if (!user) {
+            return null;
+        }
+        const session = {
+            userId: user.id,
+            username: user.username,
+            displayName: user.displayName,
+            role: user.role,
+            email: user.email,
+            loggedInAt: new Date().toISOString(),
+            authMethod: 'password',
+        };
+        void this.context.workspaceState.update(SESSION_KEY, session);
+        return session;
+    }
+    // ── Session Management ───────────────────────────────────────────────────────
+    logout() {
+        void this.context.workspaceState.update(SESSION_KEY, undefined);
+    }
+    getSession() {
+        return this.context.workspaceState.get(SESSION_KEY);
+    }
+    isLoggedIn() {
+        return !!this.getSession();
     }
     // ── User Store ──────────────────────────────────────────────────────────────
     loadUsers() {
@@ -78,46 +184,12 @@ class AuthManager {
         }
     }
     getAllUsers() {
-        // Reload from disk each time to pick up admin changes
         this.loadUsers();
         return this.users.map(({ passwordHash: _ph, ...u }) => u);
     }
     // ── Crypto ──────────────────────────────────────────────────────────────────
     static hashPassword(password) {
         return crypto.createHash('sha256').update(password).digest('hex');
-    }
-    // ── Authentication ──────────────────────────────────────────────────────────
-    /**
-     * Attempt to authenticate with username + password.
-     * Returns the session on success, or null on failure.
-     */
-    login(username, password) {
-        this.loadUsers(); // always reload for freshness
-        const hash = AuthManager.hashPassword(password);
-        const user = this.users.find(u => u.username === username && u.passwordHash === hash);
-        if (!user) {
-            return null;
-        }
-        const session = {
-            userId: user.id,
-            username: user.username,
-            displayName: user.displayName,
-            role: user.role,
-            email: user.email,
-            loggedInAt: new Date().toISOString(),
-        };
-        // Persist to workspace state
-        void this.context.workspaceState.update(SESSION_KEY, session);
-        return session;
-    }
-    logout() {
-        void this.context.workspaceState.update(SESSION_KEY, undefined);
-    }
-    getSession() {
-        return this.context.workspaceState.get(SESSION_KEY);
-    }
-    isLoggedIn() {
-        return !!this.getSession();
     }
     // ── Admin: User Management ──────────────────────────────────────────────────
     addUser(username, password, role, displayName, email) {
@@ -145,13 +217,82 @@ class AuthManager {
             return { success: false, message: 'User not found.' };
         }
         const removed = this.users[idx];
-        // Prevent removing the last admin
-        if (removed.role === 'administrator' && this.users.filter(u => u.role === 'administrator').length <= 1) {
+        if (removed.role === 'administrator' &&
+            this.users.filter(u => u.role === 'administrator').length <= 1) {
             return { success: false, message: 'Cannot remove the last administrator.' };
         }
         this.users.splice(idx, 1);
         this.saveUsers();
         return { success: true, message: `User "${removed.username}" removed.` };
+    }
+    // ── Private: GitHub Helpers ──────────────────────────────────────────────────
+    /**
+     * Call the GitHub REST API to fetch the authenticated user's profile.
+     */
+    async fetchGitHubProfile(accessToken) {
+        try {
+            const response = await fetch('https://api.github.com/user', {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    Accept: 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'User-Agent': 'Sentinel-VSCode-Extension',
+                },
+                signal: AbortSignal.timeout(5000),
+            });
+            if (!response.ok) {
+                console.error(`[AuthManager] GitHub API error: ${response.status}`);
+                return null;
+            }
+            return await response.json();
+        }
+        catch (err) {
+            console.error('[AuthManager] Failed to fetch GitHub profile:', err);
+            return null;
+        }
+    }
+    /**
+     * Find an existing local user whose githubUsername matches the profile login,
+     * or provision a new developer account automatically.
+     *
+     * Provisioning rules:
+     *   - New GitHub users → role: 'developer'
+     *   - Existing password users linked by githubUsername → keep their role
+     */
+    findOrProvisionGitHubUser(profile) {
+        this.loadUsers();
+        // 1. Look for an existing user already linked to this GitHub account
+        let user = this.users.find(u => u.githubUsername === profile.login);
+        // 2. Look for a user whose username matches the GitHub login
+        if (!user) {
+            user = this.users.find(u => u.username === profile.login);
+        }
+        // 3. Auto-provision a new developer account
+        if (!user) {
+            user = {
+                id: `user-dev-gh-${Date.now()}`,
+                username: profile.login,
+                passwordHash: '', // GitHub-only accounts have no password
+                role: 'developer',
+                displayName: profile.name ?? profile.login,
+                email: profile.email ?? `${profile.login}@github.com`,
+                createdAt: new Date().toISOString(),
+                githubUsername: profile.login,
+                githubAvatarUrl: profile.avatar_url,
+            };
+            this.users.push(user);
+            console.log(`[AuthManager] Auto-provisioned new developer: ${profile.login}`);
+        }
+        // 4. Update GitHub metadata on existing user if changed
+        if (user.githubUsername !== profile.login || user.githubAvatarUrl !== profile.avatar_url) {
+            user.githubUsername = profile.login;
+            user.githubAvatarUrl = profile.avatar_url;
+            if (!user.displayName || user.displayName === user.username) {
+                user.displayName = profile.name ?? profile.login;
+            }
+        }
+        this.saveUsers();
+        return user;
     }
 }
 exports.AuthManager = AuthManager;

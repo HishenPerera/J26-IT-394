@@ -1,0 +1,33 @@
+[
+  {
+    "id": "sess-1790956158571",
+    "shiftId": "shift-1790956132842",
+    "shiftName": "Sht1",
+    "projectId": "proj-1790956053054",
+    "projectName": "Test",
+    "developerId": "HishenPerera",
+    "developerUsername": "HishenPerera",
+    "developerDisplayName": "Hishen Sandaru Perera",
+    "githubAvatarUrl": "https://avatars.githubusercontent.com/u/165247062?v=4",
+    "startedAt": "2026-10-02T15:49:18.571Z",
+    "endedAt": "2026-10-02T15:49:39.538Z",
+    "findings": [],
+    "summary": {
+      "totalFindings": 0,
+      "criticalCount": 0,
+      "highCount": 0,
+      "mediumCount": 0,
+      "lowCount": 0,
+      "infoCount": 0,
+      "byType": {},
+      "filesAffected": [],
+      "durationMinutes": 0,
+      "securityScore": 100,
+      "trend": "improving",
+      "recommendations": [
+        "Good session. Continue reviewing OWASP Top 10 patterns to maintain your security score."
+      ],
+      "generatedAt": "2026-10-02T15:49:39.539Z"
+    }
+  }
+]

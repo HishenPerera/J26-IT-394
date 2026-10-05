@@ -1,0 +1,11 @@
+[
+  {
+    "id": "proj-1790956053054",
+    "name": "Test",
+    "description": "sdsd",
+    "supervisorId": "supervisor01",
+    "supervisorName": "Carol (Supervisor)",
+    "createdAt": "2026-10-02T15:47:33.054Z",
+    "status": "active"
+  }
+]

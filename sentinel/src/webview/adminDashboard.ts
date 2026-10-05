@@ -71,11 +71,34 @@ export function buildAdminDashboardHtml(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src ${cspSource} data:; script-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src ${cspSource} https://avatars.githubusercontent.com https://github.com data:; script-src 'unsafe-inline';">
 <title>Sentinel — Administrator Dashboard</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.6;min-height:100vh}
+body{font-family:'Inter',system-ui,sans-serif;background:#0d1117;color:#e6edf3;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+.app{display:flex;flex:1;overflow:hidden}
+.sidebar{width:220px;flex-shrink:0;background:#161b22;border-right:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;padding:16px 0;overflow-y:auto}
+.content{flex:1;overflow-y:auto;padding:24px}
+.sidebar-logo{display:flex;align-items:center;gap:10px;padding:0 16px 18px;border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:8px}
+.sidebar-logo-icon{width:32px;height:32px;background:linear-gradient(135deg,#b91c1c,#f47067);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.sidebar-logo-text{font-size:.85em;font-weight:800;color:#e6edf3;letter-spacing:-.3px}
+.sidebar-logo-role{font-size:.62em;color:#f47067;font-weight:600;letter-spacing:.3px;text-transform:uppercase}
+.nav-section-label{font-size:.62em;font-weight:700;color:#484f58;letter-spacing:.8px;text-transform:uppercase;padding:12px 16px 4px}
+.nav-item{display:flex;align-items:center;gap:9px;padding:8px 16px;margin:1px 8px;border-radius:8px;font-size:.82em;font-weight:500;color:#8b949e;cursor:pointer;transition:all .15s;border:none;background:none;width:calc(100% - 16px);text-align:left;font-family:inherit}
+.nav-item:hover{background:rgba(255,255,255,.06);color:#e6edf3}
+.nav-item.active{background:rgba(244,112,103,.12);color:#f47067;font-weight:600}
+.nav-icon{font-size:1em;width:18px;text-align:center}
+.nav-badge{margin-left:auto;background:rgba(88,166,255,.15);color:#58a6ff;border-radius:100px;padding:1px 7px;font-size:.65em;font-weight:700}
+.sidebar-bottom{margin-top:auto;padding:12px 16px 0;border-top:1px solid rgba(255,255,255,.06)}
+.sidebar-user{display:flex;align-items:center;gap:8px}
+.sidebar-avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;flex-shrink:0}
+.sidebar-avatar-initials{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#b91c1c,#f47067);display:flex;align-items:center;justify-content:center;font-size:.75em;font-weight:800;color:#fff;flex-shrink:0}
+.sidebar-user-name{font-size:.75em;font-weight:600;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar-user-role{font-size:.62em;color:#f47067;font-weight:600}
+.section-title{font-size:1.2em;font-weight:800;color:#e6edf3;margin-bottom:6px}
+.section-sub{font-size:.8em;color:#8b949e;margin-bottom:20px}
+.section-content{display:none}
+.section-content.active{display:block}
 .hero{background:linear-gradient(135deg,#0d1117 0%,#1f1b2e 55%,#161b22 100%);border-bottom:1px solid rgba(255,255,255,.08);padding:16px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
 .brand{display:flex;align-items:center;gap:10px}
 .logo-img{width:34px;height:34px;object-fit:contain;border-radius:8px}
@@ -138,134 +161,147 @@ select option{background:#161b22;color:#e6edf3}
 </head>
 <body>
 ${buildHeaderBar(session, cspSource)}
-<div class="hero">
-  <div class="brand">
-    ${logoEl}
-    <div>
-      <div class="bname">Sentinel</div>
-      <div class="bsub">Administrator Dashboard</div>
-    </div>
-  </div>
-  <div class="admin-badge">🔐 Full System Access</div>
-</div>
-<div class="wrap">
-  <!-- KPIs -->
-  <div class="kpi-row">
-    <div class="kpi"><div class="kpi-ico">👥</div><div class="kpi-num" style="color:#58a6ff">${users.length}</div><div class="kpi-lbl">Total Users</div></div>
-    <div class="kpi"><div class="kpi-ico">🧑‍💻</div><div class="kpi-num" style="color:#58a6ff">${users.filter(u=>u.role==='developer').length}</div><div class="kpi-lbl">Developers</div></div>
-    <div class="kpi"><div class="kpi-ico">👁️</div><div class="kpi-num" style="color:#d29922">${users.filter(u=>u.role==='supervisor').length}</div><div class="kpi-lbl">Supervisors</div></div>
-    <div class="kpi"><div class="kpi-ico">🔐</div><div class="kpi-num" style="color:#f47067">${users.filter(u=>u.role==='administrator').length}</div><div class="kpi-lbl">Admins</div></div>
-    <div class="kpi"><div class="kpi-ico">📋</div><div class="kpi-num">${totalFindings}</div><div class="kpi-lbl">All Findings</div></div>
-    <div class="kpi"><div class="kpi-ico">🚨</div><div class="kpi-num" style="color:#f47067">${totalCritical}</div><div class="kpi-lbl">Critical</div></div>
-    <div class="kpi"><div class="kpi-ico">⭐</div><div class="kpi-num" style="color:${avgScore>=80?'#3fb950':avgScore>=50?'#d29922':'#f47067'}">${avgScore}</div><div class="kpi-lbl">Avg Score</div></div>
-  </div>
-
-  <!-- User Management Table -->
-  <div class="section">
-    <div class="sec-hdr">
-      <span class="sec-title">👥 User Management</span>
-    </div>
-    <div id="tableMsg" class="msg"></div>
-    <div style="overflow-x:auto">
-      <table class="user-table" id="userTable">
-        <thead>
-          <tr>
-            <th></th>
-            <th>User</th>
-            <th>Role</th>
-            <th>Email</th>
-            <th style="text-align:center">Findings</th>
-            <th style="text-align:center">Joined</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="userTbody">
-          ${userRows}
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Add User Form -->
-  <div class="section">
-    <div class="sec-hdr">
-      <span class="sec-title">➕ Add New User</span>
-    </div>
-    <div class="sec-body">
-      <div class="add-form">
-        <div class="fg">
-          <label for="newUsername">Username</label>
-          <input id="newUsername" type="text" placeholder="e.g. dev03">
-        </div>
-        <div class="fg">
-          <label for="newPassword">Password</label>
-          <input id="newPassword" type="password" placeholder="Min 6 characters">
-        </div>
-        <div class="fg">
-          <label for="newDisplayName">Display Name</label>
-          <input id="newDisplayName" type="text" placeholder="e.g. Charlie (Dev)">
-        </div>
-        <div class="fg">
-          <label for="newEmail">Email</label>
-          <input id="newEmail" type="email" placeholder="user@domain.com">
-        </div>
-        <div class="fg">
-          <label for="newRole">Role</label>
-          <select id="newRole">
-            <option value="developer">🧑‍💻 Developer</option>
-            <option value="supervisor">👁️ Supervisor</option>
-            <option value="administrator">🔐 Administrator</option>
-          </select>
-        </div>
-        <div class="fg">
-          <label>&nbsp;</label>
-          <button class="btn-add" onclick="addUser()">Add User</button>
-        </div>
-      </div>
-      <div id="addMsg" class="msg"></div>
-    </div>
-  </div>
-
-  <!-- System Config -->
-  <div class="section">
-    <div class="sec-hdr">
-      <span class="sec-title">⚙️ System Configuration</span>
-    </div>
-    <div class="sec-body">
-      <div class="cfg-grid">
-        <div class="cfg-item"><div class="cfg-key">Extension Version</div><div class="cfg-val">${escHtml(extensionVersion)}</div></div>
-        <div class="cfg-item"><div class="cfg-key">Backend API URL</div><div class="cfg-val">${escHtml(backendUrl)}</div></div>
-        <div class="cfg-item"><div class="cfg-key">Data Directory</div><div class="cfg-val">${escHtml(dataDir)}</div></div>
-        <div class="cfg-item"><div class="cfg-key">Total Developer Record Files</div><div class="cfg-val">${devStats.length}</div></div>
+<div class="app">
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <div class="sidebar-logo-icon">🔐</div>
+      <div>
+        <div class="sidebar-logo-text">Sentinel</div>
+        <div class="sidebar-logo-role">Admin</div>
       </div>
     </div>
-  </div>
+    <div class="nav-section-label">Admin</div>
+    <button class="nav-item active" id="nav-overview" onclick="showSection('overview')"><span class="nav-icon">🏠</span> Overview</button>
+    <button class="nav-item" id="nav-users" onclick="showSection('users')"><span class="nav-icon">👥</span> Users <span class="nav-badge">${users.length}</span></button>
+    <button class="nav-item" id="nav-analytics" onclick="showSection('analytics')"><span class="nav-icon">📊</span> Analytics</button>
+    <button class="nav-item" id="nav-system" onclick="showSection('system')"><span class="nav-icon">⚙️</span> System</button>
+    <div class="sidebar-bottom">
+      <div class="sidebar-user">
+        ${session.githubAvatarUrl
+          ? `<img src="${escHtml(session.githubAvatarUrl)}?s=48" class="sidebar-avatar" onerror="this.style.display='none';">`
+          : `<div class="sidebar-avatar-initials">${escHtml(session.displayName.charAt(0).toUpperCase())}</div>`}
+        <div>
+          <div class="sidebar-user-name">${escHtml(session.displayName)}</div>
+          <div class="sidebar-user-role">🔐 Admin</div>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="content">
+    <!-- OVERVIEW -->
+    <div class="section-content active" id="section-overview">
+      <div class="section-title">🏠 System Overview</div>
+      <div class="section-sub">Sentinel Research System — Full Administrator Access</div>
+      <div class="kpi-row">
+        <div class="kpi"><div class="kpi-ico">👥</div><div class="kpi-num" style="color:#58a6ff">${users.length}</div><div class="kpi-lbl">Total Users</div></div>
+        <div class="kpi"><div class="kpi-ico">🧑‍💻</div><div class="kpi-num" style="color:#58a6ff">${users.filter(u=>u.role==='developer').length}</div><div class="kpi-lbl">Developers</div></div>
+        <div class="kpi"><div class="kpi-ico">👁️</div><div class="kpi-num" style="color:#d29922">${users.filter(u=>u.role==='supervisor').length}</div><div class="kpi-lbl">Supervisors</div></div>
+        <div class="kpi"><div class="kpi-ico">🔐</div><div class="kpi-num" style="color:#f47067">${users.filter(u=>u.role==='administrator').length}</div><div class="kpi-lbl">Admins</div></div>
+        <div class="kpi"><div class="kpi-ico">📋</div><div class="kpi-num">${totalFindings}</div><div class="kpi-lbl">All Findings</div></div>
+        <div class="kpi"><div class="kpi-ico">🚨</div><div class="kpi-num" style="color:#f47067">${totalCritical}</div><div class="kpi-lbl">Critical</div></div>
+        <div class="kpi"><div class="kpi-ico">⭐</div><div class="kpi-num" style="color:${avgScore>=80?'#3fb950':avgScore>=50?'#d29922':'#f47067'}">${avgScore}</div><div class="kpi-lbl">Avg Score</div></div>
+      </div>
+    </div>
+
+    <!-- USERS -->
+    <div class="section-content" id="section-users">
+      <div class="section-title">👥 User Management</div>
+      <div class="section-sub">Add, remove, and manage all system users</div>
+      <div class="section">
+        <div class="sec-hdr"><span class="sec-title">All Users</span></div>
+        <div id="tableMsg" class="msg"></div>
+        <div style="overflow-x:auto">
+          <table class="user-table" id="userTable">
+            <thead><tr><th></th><th>User</th><th>Role</th><th>Email</th><th style="text-align:center">Findings</th><th style="text-align:center">Joined</th><th></th></tr></thead>
+            <tbody id="userTbody">${userRows}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="section">
+        <div class="sec-hdr"><span class="sec-title">➕ Add New User</span></div>
+        <div class="sec-body">
+          <div class="add-form">
+            <div class="fg"><label for="newUsername">Username</label><input id="newUsername" type="text" placeholder="e.g. dev03"></div>
+            <div class="fg"><label for="newPassword">Password</label><input id="newPassword" type="password" placeholder="Min 6 characters"></div>
+            <div class="fg"><label for="newDisplayName">Display Name</label><input id="newDisplayName" type="text" placeholder="e.g. Charlie (Dev)"></div>
+            <div class="fg"><label for="newEmail">Email</label><input id="newEmail" type="email" placeholder="user@domain.com"></div>
+            <div class="fg"><label for="newRole">Role</label>
+              <select id="newRole">
+                <option value="developer">🧑‍💻 Developer</option>
+                <option value="supervisor">👁️ Supervisor</option>
+                <option value="administrator">🔐 Administrator</option>
+              </select>
+            </div>
+            <div class="fg"><label>&nbsp;</label><button class="btn-add" onclick="addUser()">Add User</button></div>
+          </div>
+          <div id="addMsg" class="msg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ANALYTICS -->
+    <div class="section-content" id="section-analytics">
+      <div class="section-title">📊 Team Analytics</div>
+      <div class="section-sub">Security scores across all developers in the system</div>
+      ${devStats.map(d => {
+        const sc = d.score>=80?'#3fb950':d.score>=50?'#d29922':'#f47067';
+        return `<div style="background:#161b22;border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:12px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:.85em;font-weight:600;color:#e6edf3">${escHtml(d.developerId)}</div>
+          <div style="display:flex;gap:14px;font-size:.78em;font-weight:700">
+            <span style="color:#f47067">${d.critical} CRIT</span>
+            <span style="color:#e09b3d">${d.high} HIGH</span>
+            <span style="color:#d29922">${d.medium} MED</span>
+            <span style="color:#3fb950">${d.low} LOW</span>
+            <span style="color:${sc};font-size:1.05em">${d.score} score</span>
+          </div>
+        </div>`;
+      }).join('') || '<div style="color:#484f58;text-align:center;padding:20px">No developer records yet.</div>'}
+    </div>
+
+    <!-- SYSTEM -->
+    <div class="section-content" id="section-system">
+      <div class="section-title">⚙️ System Configuration</div>
+      <div class="section-sub">Extension settings and runtime information</div>
+      <div class="section">
+        <div class="sec-hdr"><span class="sec-title">Configuration</span></div>
+        <div class="sec-body">
+          <div class="cfg-grid">
+            <div class="cfg-item"><div class="cfg-key">Extension Version</div><div class="cfg-val">${escHtml(extensionVersion)}</div></div>
+            <div class="cfg-item"><div class="cfg-key">Backend API URL</div><div class="cfg-val">${escHtml(backendUrl)}</div></div>
+            <div class="cfg-item"><div class="cfg-key">Data Directory</div><div class="cfg-val">${escHtml(dataDir)}</div></div>
+            <div class="cfg-item"><div class="cfg-key">Developer Record Files</div><div class="cfg-val">${devStats.length}</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
 </div>
 
 <script>
-const vscode = acquireVsCodeApi();
+window._vscode = acquireVsCodeApi();
+const vscode = window._vscode;
+
+function showSection(id) {
+  document.querySelectorAll('.section-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const sec = document.getElementById('section-' + id); if (sec) sec.classList.add('active');
+  const nav = document.getElementById('nav-' + id); if (nav) nav.classList.add('active');
+}
 
 function showMsg(id, type, text) {
-  var el = document.getElementById(id);
-  el.className = 'msg ' + type;
-  el.textContent = text;
+  var el = document.getElementById(id); el.className = 'msg ' + type; el.textContent = text;
   setTimeout(function(){ el.className = 'msg'; }, 4000);
 }
 
 function addUser() {
-  var username = document.getElementById('newUsername').value.trim();
-  var password = document.getElementById('newPassword').value;
+  var username    = document.getElementById('newUsername').value.trim();
+  var password    = document.getElementById('newPassword').value;
   var displayName = document.getElementById('newDisplayName').value.trim();
-  var email = document.getElementById('newEmail').value.trim();
-  var role = document.getElementById('newRole').value;
-  if (!username || !password || !displayName || !email) {
-    showMsg('addMsg', 'err', 'Please fill in all fields.');
-    return;
-  }
-  if (password.length < 6) {
-    showMsg('addMsg', 'err', 'Password must be at least 6 characters.');
-    return;
-  }
+  var email       = document.getElementById('newEmail').value.trim();
+  var role        = document.getElementById('newRole').value;
+  if (!username || !password || !displayName || !email) { showMsg('addMsg','err','Please fill in all fields.'); return; }
+  if (password.length < 6) { showMsg('addMsg','err','Password must be at least 6 characters.'); return; }
   vscode.postMessage({ command: 'ADMIN_ADD_USER', username, password, displayName, email, role });
 }
 
@@ -277,25 +313,15 @@ function removeUser(userId, username) {
 window.addEventListener('message', function(event) {
   var msg = event.data;
   if (msg.command === 'ADMIN_USER_RESULT') {
-    if (msg.success) {
-      showMsg('tableMsg', 'ok', msg.message);
-      // Refresh the dashboard to reflect changes
-      setTimeout(function(){ vscode.postMessage({ command: 'REFRESH_ADMIN' }); }, 1200);
-    } else {
-      showMsg('tableMsg', 'err', msg.message);
-    }
+    if (msg.success) { showMsg('tableMsg','ok',msg.message); setTimeout(function(){ vscode.postMessage({ command: 'REFRESH_ADMIN' }); }, 1200); }
+    else { showMsg('tableMsg','err',msg.message); }
   }
   if (msg.command === 'ADMIN_ADD_RESULT') {
     if (msg.success) {
-      showMsg('addMsg', 'ok', msg.message);
-      document.getElementById('newUsername').value = '';
-      document.getElementById('newPassword').value = '';
-      document.getElementById('newDisplayName').value = '';
-      document.getElementById('newEmail').value = '';
+      showMsg('addMsg','ok',msg.message);
+      ['newUsername','newPassword','newDisplayName','newEmail'].forEach(id => document.getElementById(id).value = '');
       setTimeout(function(){ vscode.postMessage({ command: 'REFRESH_ADMIN' }); }, 1200);
-    } else {
-      showMsg('addMsg', 'err', msg.message);
-    }
+    } else { showMsg('addMsg','err',msg.message); }
   }
 });
 </script>
@@ -304,5 +330,5 @@ window.addEventListener('message', function(event) {
 }
 
 function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
